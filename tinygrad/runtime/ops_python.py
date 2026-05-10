@@ -4,9 +4,10 @@
 # this is the (living) definition of uops
 from typing import Any, TYPE_CHECKING
 import pickle, base64, itertools, time, sys, functools
+from dataclasses import replace
 from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
-from tinygrad.helpers import all_same, getenv, flatten, get_single_element, EMULATE
-from tinygrad.device import Compiled, Compiler, Allocator, CompilerSet
+from tinygrad.helpers import all_same, getenv, flatten, get_single_element, Target, IMAGE
+from tinygrad.device import Compiled, Compiler, Allocator
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, bitcast
 from tinygrad.renderer import Renderer
@@ -17,8 +18,8 @@ def _load(m, i, dtype: DType):
   return from_storage_scalar(m[i], dtype)
 
 def load(inp, j, dtype: DType):
-  if len(inp) == 2: return [_load(m, x+j if x is not None else None, dtype) if gate else default for (m,x,gate),default in zip(*inp)]
-  return [_load(m, x+j if x is not None else None, dtype) for m,x,_ in inp[0]]
+  if len(inp) >= 3: return [_load(m, x+j if x is not None else None, dtype) if gate else default for (m,x),default,gate in zip(*inp[:3])]
+  return [_load(m, x+j if x is not None else None, dtype) for m,x in inp[0]]
 
 def _store(m, i, v, dtype: DType):
   if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
@@ -66,8 +67,9 @@ class PythonProgram:
           continue
         assert dtype is not None, f"{uop} is missing a dtype"
         if uop is Ops.STORE:
+          store_gate = src_values[2] if len(src_values) >= 3 else [True] * warp_size
           for j,val in enumerate(src_values[1] if src_dtypes[1].count > 1 else [src_values[1]]):
-            for (m,o,g),v in zip(src_values[0], val):
+            for (m,o),v,g in zip(src_values[0], val, store_gate):
               if g: _store(m, o+j, v, src_dtypes[1].scalar())
           i += 1
           continue
@@ -90,6 +92,7 @@ class PythonProgram:
           elif arg[0] == 'l': values[i] = [x[2-int(arg[-1])] for x in warp]
         elif uop is Ops.CONST: values[i] = [arg] * warp_size
         elif uop is Ops.INDEX:
+          if len(src_values) != 2: raise RuntimeError("gates must be on LOAD/STORE, not INDEX")
           ret:list = []
           if isinstance(src_dtypes[0], ImageDType):
             for m,ox,oy in zip(src_values[0], src_values[1][0], src_values[1][1]):
@@ -97,7 +100,7 @@ class PythonProgram:
               else: ret.append((m, ox*4 + oy*src_dtypes[0].shape[1]*4))
           else:
             for m,o in zip(src_values[0], src_values[1]): ret.append((m,o))
-          values[i] = [(m,o,g) for (m,o),g in zip(ret, src_values[2] if len(src_values) == 3 else [True]*len(ret))] # set the gate last
+          values[i] = ret
         elif uop is Ops.CAST and isinstance(dtype, PtrDType):
           values[i] = src_values[0]
         elif uop is Ops.RANGE:
@@ -109,10 +112,10 @@ class PythonProgram:
             del values[i]
             i = loop_ends[i] + 1
             continue
-        elif uop is Ops.VECTORIZE: values[i] = src_values
+        elif uop is Ops.STACK: values[i] = src_values
         elif uop is Ops.BITCAST: values[i] = [bitcast(x, src_dtypes[0], dtype) for x in src_values[0]]
         elif uop is Ops.CAST:
-          values[i] = [truncate.get(dtype, lambda dt: dt)(dtypes.as_const(x, dtype)) for x in src_values[0]]
+          values[i] = [truncate.get(dtype, lambda dt: dt)(dtype.const(x)) for x in src_values[0]]
         elif uop is Ops.LOAD:
           if dtype.count > 1:
             values[i] = [load([src_values[i][j] if i != 0 and src_dtypes[i].count > 1 else src_values[i] \
@@ -201,23 +204,24 @@ class PythonCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
 class PythonRenderer(Renderer):
-  device = "PYTHON"
   code_for_op = python_alu
   compiler = PythonCompiler()
 
-  def __init__(self):
-    match EMULATE.value:
-      case "METAL": self.device, self.tensor_cores = "METAL", tc.metal
-      case "AMD": self.device, self.tensor_cores = "AMD", tc.amd_rdna3
-      case "AMD_MFMA": self.device, self.tensor_cores = "AMD", tc.amd_cdna4
-      case "AMD_RDNA4": self.device, self.tensor_cores = "AMD", tc.amd_rdna4
-      case "CUDA": self.device, self.tensor_cores = "CUDA", tc.cuda_sm80
-      case "CUDA_SM75": self.device, self.tensor_cores = "CUDA", tc.cuda_sm75
-      case "CUDA_SM89": self.device, self.tensor_cores = "CUDA", tc.cuda_sm89
-      case "INTEL": self.device, self.suffix, self.tensor_cores = "INTEL", "INTEL", tc.intel
-      case "AMX": self.device, self.tensor_cores = "CPU", tc.amx
-      case "": pass
-      case _: raise RuntimeError(f"can't EMULATE device: {EMULATE.value}")
+  def __init__(self, target:Target):
+    assert (emu:=getenv("EMULATE", "")) == "", ("EMULATE is deprecated, use DEV=PYTHON::" +
+      {"AMD":"gfx1100", "AMD_RDNA4":"gfx1201", "AMD_MFMA":"gfx950", "CUDA":"sm_80", "CUDA_SM75":"sm_75", "CUDA_SM89":"sm_89"}.get(emu, emu))
+    target = replace(target, renderer="PYTHON")
+    if target.arch == "METAL": self.target, self.tensor_cores = replace(target, device="METAL"), tc.metal
+    elif target.arch == "INTEL": self.target, self.suffix, self.tensor_cores = replace(target, device="INTEL"), "INTEL", tc.intel
+    elif target.arch == "AMX": self.target, self.tensor_cores = replace(target, device="CPU"), tc.amx
+    elif target.arch.startswith("gfx"):
+      self.target = replace(target, device="AMD")
+      self.tensor_cores = tc.get_amd(target.arch)
+    elif target.arch.startswith("sm"):
+      self.target = replace(target, device="CUDA")
+      self.tensor_cores = tc.get_cuda(target.arch)
+    elif IMAGE and not target.arch: self.target = replace(target, arch="IMAGE_PITCH_ALIGNMENT=1")
+    else: self.target = target
 
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
@@ -231,4 +235,4 @@ class PythonAllocator(Allocator['PythonDevice']):
 
 class PythonDevice(Compiled):
   def __init__(self, device:str):
-    super().__init__(device, PythonAllocator(self), CompilerSet([(PythonRenderer, None)]), PythonProgram)
+    super().__init__(device, PythonAllocator(self), [PythonRenderer], PythonProgram)

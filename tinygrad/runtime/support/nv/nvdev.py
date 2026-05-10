@@ -1,9 +1,10 @@
 from __future__ import annotations
-import ctypes, time, functools, re, gzip, struct
+import ctypes, time, functools, re
 from tinygrad.helpers import getenv, DEBUG, fetch, getbits
+from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP
-from tinygrad.runtime.support.system import PCIDevice, PCIDevImplBase, MMIOInterface
+from tinygrad.runtime.support.system import PCIDevice, MMIOInterface
 
 NV_DEBUG = getenv("NV_DEBUG", 0)
 
@@ -69,7 +70,7 @@ class NVMemoryManager(MemoryManager):
 
   def on_range_mapped(self): self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.write((1 << 0) | (1 << 1) | (1 << 6) | (1 << 31))
 
-class NVDev(PCIDevImplBase):
+class NVDev:
   def __init__(self, pci_dev:PCIDevice):
     self.pci_dev, self.devfmt, self.mmio = pci_dev, pci_dev.pcibus, pci_dev.map_bar(0, fmt='I')
 
@@ -102,14 +103,16 @@ class NVDev(PCIDevImplBase):
     self.include("src/common/inc/swref/published/ampere/ga102/dev_gc6_island_addendum.h")
 
     if (needs_reset:=self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0):
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
       if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.", flush=True)
       self.pci_dev.reset()
       time.sleep(0.1) # wait until device can respond again
 
+    self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
     self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
     self.chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
-    self.fw_name = {"GB2": "GB202", "AD1": "AD102", "GA1": "GA102"}[self.chip_name[:3]]
+    self.fw_name = {"GB2": "gb202", "AD1": "ad102", "GA1": "ga102"}[self.chip_name[:3]]
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
 
     self.flcn:NV_FLCN|NV_FLCN_COT = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
@@ -149,22 +152,14 @@ class NVDev(PCIDevImplBase):
     if data is not None: view[:size] = data
     return view, paddrs
 
-  def _alloc_boot_struct(self, struct:ctypes.Structure) -> tuple[ctypes.Structure, int]:
+  def _alloc_boot_struct(self, struct:ctypes.Structure) -> tuple[MMIOInterface, int]:
     view, paddrs = self._alloc_sysmem(sz:=ctypes.sizeof(type(struct)), contiguous=True)
     view[:sz] = bytes(struct)
-    return type(struct).from_address(view.addr), paddrs[0]
+    return view, paddrs[0]
 
   def _download(self, file:str) -> str:
     url = f"https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/{file}"
     return fetch(url, subdir="defines").read_text()
-
-  def extract_fw(self, file:str, dname:str) -> bytes:
-    # Extracts the firmware binary from the given header
-    tname = file.replace("kgsp", "kgspGet")
-    text = self._download(f"src/nvidia/generated/g_bindata_{tname}_{self.fw_name}.c")
-    info, sl = text[text[:text.index(dnm:=f'{file}_{self.fw_name}_{dname}')].rindex("COMPRESSION:"):][:16], text[text.index(dnm) + len(dnm) + 7:]
-    image = bytes.fromhex(sl[:sl.find("};")].strip().replace("0x", "").replace(",", "").replace(" ", "").replace("\n", ""))
-    return gzip.decompress(struct.pack("<4BL2B", 0x1f, 0x8b, 8, 0, 0, 0, 3) + image) if "COMPRESSION: YES" in info else image
 
   def include(self, file:str):
     def _do_eval(s:str): return eval(s) # pylint: disable=eval-used

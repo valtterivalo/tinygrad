@@ -1,8 +1,7 @@
 from __future__ import annotations
 import platform, sys, ctypes, functools, time, mmap, threading, queue
 from tinygrad.helpers import to_mv, OSX, WIN, mv_address, suppress_finalizing, unwrap, data64_le
-from tinygrad.helpers import CPU_CC, CPU_LVP, CPU_LLVM
-from tinygrad.device import BufferSpec, DMACPURef, CompilerSet
+from tinygrad.device import BufferSpec
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HWQueue, HCQArgsState, HCQSignal, HCQProgram, MMIOInterface
 from tinygrad.runtime.support.hcq import CLikeArgsState
 from tinygrad.renderer.cstyle import ClangJITRenderer
@@ -45,7 +44,7 @@ class CPUComputeQueue(HWQueue):
   def _exec(self, tid, prg, bufs, *args):
     vals = list(args[bufs:])
     if 'core_id' in prg.runtimevars: vals[prg.runtimevars['core_id']] = tid
-    prg.fxn(*map(ctypes.c_uint64, args[:bufs]), *map(ctypes.c_int64 if platform.machine() == "arm64" else ctypes.c_int32, vals))
+    prg.fxn(*map(ctypes.c_uint64, args[:bufs]), *map(ctypes.c_int64 if platform.machine().lower() == "arm64" else ctypes.c_int32, vals))
   def _signal(self, tid, signal_addr, value): to_mv(signal_addr, 4).cast('I')[0] = value
   def _wait(self, tid, tmpl_sig, signal_addr, value):
     tmpl_sig.base_buf = HCQBuffer(signal_addr, 16, view=MMIOInterface(signal_addr, 16))
@@ -129,9 +128,6 @@ class CPUAllocator(HCQAllocator):
   def _as_buffer(self, src) -> memoryview:
     self.dev.synchronize()
     return to_mv(src.va_addr, src.size)
-  def _as_dmaref(self, buf):
-    self.dev.synchronize()
-    return DMACPURef(buf.va_addr, buf.size)
   def _map(self, buf:HCQBuffer):
     if buf.view is None or not isinstance(buf.view, MMIOInterface): raise RuntimeError("Cannot map buffer without view to cpu")
 
@@ -139,5 +135,5 @@ class CPUDevice(HCQCompiled):
   def __init__(self, device:str=""):
     self.tasks:queue.Queue = queue.Queue()
     CPUWorker(self, self.tasks, thread_id=0).start()
-    compilers = CompilerSet([(ClangJITRenderer, None), (CPULLVMRenderer, CPU_LLVM), (LVPRenderer, CPU_LVP)], ctrl_var=CPU_CC)
-    super().__init__(device, CPUAllocator(self), compilers, functools.partial(CPUProgram, self), CPUSignal, CPUComputeQueue)
+    super().__init__(device, CPUAllocator(self), [ClangJITRenderer, CPULLVMRenderer, LVPRenderer], functools.partial(CPUProgram, self), CPUSignal,
+                     CPUComputeQueue, arch={'amd64':'x86_64', 'aarch64':'arm64'}.get(m:=platform.machine().lower(), m)+",native")

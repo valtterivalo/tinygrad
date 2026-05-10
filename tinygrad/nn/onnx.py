@@ -2,7 +2,8 @@
 from typing import Any, Sequence, cast, Literal, NamedTuple, Generator
 import dataclasses, functools, io, math, types, warnings, pathlib, sys, os, struct, enum
 from tinygrad.nn.state import TensorIO
-from tinygrad.tensor import Tensor, _broadcast_shape, ReductionStr
+from tinygrad.tensor import Tensor, _broadcast_shape
+from tinygrad.mixin import ReductionStr
 from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, is_numpy_ndarray, get_single_element, polyN
 from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
 from tinygrad.device import is_dtype_supported, Device
@@ -159,7 +160,7 @@ class OnnxPBParser:
         case 4: obj["domain"] = self.reader.read_string()
         case 5: obj["model_version"] = self.reader.read_int64()
         case 7: obj["graph"] = self._parse_GraphProto()
-        case 8: obj["opset_import"].append(self._parse_OperatorSetIdProto())
+        case 8: obj["opset_import"].append(self._parse_proto(self._SIMPLE_PROTOS["OperatorSetIdProto"]))
         case _: self.reader.skip_field(wire_type)
 
     # update opset version
@@ -213,7 +214,7 @@ class OnnxPBParser:
         case 9: obj["raw_data"] = self.reader.read_bytes()
         case 10: obj["double_data"] = self.reader.read_packed_floats()
         case 11: obj["uint64_data"] = self.reader.read_packed_int64s()
-        case 13: obj.setdefault("external_data", []).append(self._parse_StringStringEntryProto())
+        case 13: obj.setdefault("external_data", []).append(self._parse_proto(self._SIMPLE_PROTOS["StringStringEntryProto"]))
         case 14: obj["data_location"] = self.reader.read_int64()
         case _: self.reader.skip_field(wire_type)
 
@@ -280,7 +281,7 @@ class OnnxPBParser:
     for fid, wire_type in self._parse_message(self._decode_end_pos()):
       match fid:
         case 1: obj["name"] = self.reader.read_string()
-        case 2: obj["type"] = self._parse_TypeProto()
+        case 2: obj["type"] = self._parse_proto(self._SIMPLE_PROTOS["TypeProto"])
         case _: self.reader.skip_field(wire_type)
 
     # parse type
@@ -294,66 +295,26 @@ class OnnxPBParser:
                                    OnnxDataType(type_obj['tensor_type']['elem_type']).to_dtype(), is_optional, is_sequence)
     return obj
 
-  def _parse_TypeProto(self) -> dict:
+  _SIMPLE_PROTOS: dict[str, dict[int, tuple[str, str]]] = {
+    "TypeProto": {1: ("tensor_type", "TypeProtoTensor"), 4: ("sequence_type", "TypeProtoWrapper"),
+                  9: ("optional_type", "TypeProtoWrapper")},
+    "TypeProtoTensor": {1: ("elem_type", "read_int64"), 2: ("shape", "TensorShapeProto")},
+    "TypeProtoWrapper": {1: ("elem_type", "TypeProto")},
+    "TensorShapeProto": {1: ("+dim", "TensorShapeProtoDimension")},
+    "TensorShapeProtoDimension": {1: ("dim_value", "read_int64"), 2: ("dim_param", "read_string")},
+    "StringStringEntryProto": {1: ("key", "read_string"), 2: ("value", "read_string")},
+    "OperatorSetIdProto": {1: ("domain", "read_string"), 2: ("version", "read_int64")},
+  }
+  def _parse_proto(self, fields: dict[int, tuple[str, str]]) -> dict:
     obj: dict[str, Any] = {}
     for fid, wire_type in self._parse_message(self._decode_end_pos()):
-      match fid:
-        case 1: obj["tensor_type"] = self._parse_TypeProtoTensor()
-        case 4: obj["sequence_type"] = self._parse_TypeProtoWrapper()
-        case 9: obj["optional_type"] = self._parse_TypeProtoWrapper()
-        case _: self.reader.skip_field(wire_type)
-    return obj
-
-  def _parse_TypeProtoTensor(self) -> dict:
-    obj: dict[str, Any] = {}
-    for fid, wire_type in self._parse_message(self._decode_end_pos()):
-      match fid:
-        case 1: obj["elem_type"] = self.reader.read_int64()
-        case 2: obj["shape"] = self._parse_TensorShapeProto()
-        case _: self.reader.skip_field(wire_type)
-    return obj
-
-  def _parse_TypeProtoWrapper(self) -> dict:
-    obj = {}
-    for fid, wire_type in self._parse_message(self._decode_end_pos()):
-      match fid:
-        case 1: obj["elem_type"] = self._parse_TypeProto()
-        case _: self.reader.skip_field(wire_type)
-    return obj
-
-  def _parse_TensorShapeProto(self) -> dict:
-    obj: dict[str, Any] = {"dim": []}
-    for fid, wire_type in self._parse_message(self._decode_end_pos()):
-      match fid:
-        case 1: obj["dim"].append(self._parse_TensorShapeProtoDimension())
-        case _: self.reader.skip_field(wire_type)
-    return obj
-
-  def _parse_TensorShapeProtoDimension(self) -> dict:
-    obj: dict[str, Any] = {}
-    for fid, wire_type in self._parse_message(self._decode_end_pos()):
-      match fid:
-        case 1: obj["dim_value"] = self.reader.read_int64()
-        case 2: obj["dim_param"] = self.reader.read_string()
-        case _: self.reader.skip_field(wire_type)
-    return obj
-
-  def _parse_StringStringEntryProto(self) -> dict:
-    obj: dict[str, Any] = {}
-    for fid, wire_type in self._parse_message(self._decode_end_pos()):
-      match fid:
-        case 1: obj["key"] = self.reader.read_string()
-        case 2: obj["value"] = self.reader.read_string()
-        case _: self.reader.skip_field(wire_type)
-    return obj
-
-  def _parse_OperatorSetIdProto(self) -> dict:
-    obj: dict[str, Any] = {}
-    for fid, wire_type in self._parse_message(self._decode_end_pos()):
-      match fid:
-        case 1: obj["domain"] = self.reader.read_string()
-        case 2: obj["version"] = self.reader.read_int64()
-        case _: self.reader.skip_field(wire_type)
+      if fid not in fields:
+        self.reader.skip_field(wire_type)
+        continue
+      name, action = fields[fid]
+      value = self._parse_proto(self._SIMPLE_PROTOS[action]) if action in self._SIMPLE_PROTOS else getattr(self.reader, action)()
+      if name[0] == "+": obj.setdefault(name[1:], []).append(value)
+      else: obj[name] = value
     return obj
 
 # ***** python const *****
@@ -511,7 +472,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     o_ = [((i - 1) // s + 1) for i,s in zip(i_, s_)]
     return _onnx_pads_to_tiny_pads(_auto_pad([(o-1)*s+k-i for o,i,k,s in zip(o_, i_, k_, s_)], auto_pad))
 
-  def _clamp_cast(x:Tensor, dtype:DType): return x.clamp(dtypes.min(dtype), dtypes.max(dtype)).cast(dtype)
+  def _clamp_cast(x:Tensor, dtype:DType): return x.clamp(dtype.min, dtype.max).cast(dtype)
 
   def _prepare_quantize(x:Tensor, scale:Tensor, zero_point:Tensor|int, axis=1, block_size=0):
     if axis < 0: axis += x.ndim
@@ -643,7 +604,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def BitwiseOr(x:Tensor,y:Tensor): return x | y
   def BitwiseXor(x:Tensor,y:Tensor): return x ^ y
   def BitwiseNot(x:Tensor): return ~x
-  def Mod(x:Tensor,y:Tensor,fmod=0): return x - x.div(y, rounding_mode="trunc") * y if fmod else x % y
+  def Mod(x:Tensor,y:Tensor,fmod=0): return x.fmod(y) if fmod else x % y
 
   # ***** Casting Ops *****
   # NOTE: saturate only applies to FP8 types
@@ -1223,7 +1184,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
 
   def DynamicQuantizeLinear(x: Tensor):
     # only support uint8
-    qmin, qmax = dtypes.min(dtypes.uint8), dtypes.max(dtypes.uint8)
+    qmin, qmax = dtypes.uint8.min, dtypes.uint8.max
     scale = (x.max().maximum(0) + ((-x).max()).maximum(0)) / (qmax - qmin)
     zero_point = _clamp_cast((qmin - x.min() / scale).round(), dtypes.uint8)
     y = _clamp_cast((x / scale).round() + zero_point, dtypes.uint8)
